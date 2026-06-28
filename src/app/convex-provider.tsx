@@ -51,7 +51,7 @@ function AuthenticatedConvexProvider({
   );
 }
 
-function useConvexAuthFromSession() {
+export function useConvexAuthFromSession() {
   const { status } = useSession();
 
   const fetchAccessToken = useCallback(async () => {
