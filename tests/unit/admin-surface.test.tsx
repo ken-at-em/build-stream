@@ -6,7 +6,8 @@ import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BuildStreamApp } from "@/app/stream-app";
-import { SettingsApp } from "@/app/settings/settings-app";
+import { MySettingsApp } from "@/app/settings/my-settings-app";
+import { TeamSettingsApp } from "@/app/settings/team/team-settings-app";
 import { useBuildStreamWorkspace, type WorkspaceState } from "@/app/workspace-state";
 
 vi.mock("convex/react", () => ({
@@ -99,15 +100,46 @@ describe("admin surfaces", () => {
 
     render(<BuildStreamApp />);
 
-    expect(screen.getByRole("link", { name: /team settings/i }).getAttribute("href")).toBe(
+    expect(screen.getByRole("link", { name: /my settings/i }).getAttribute("href")).toBe(
       "/settings",
+    );
+    expect(screen.getByRole("link", { name: /team settings/i }).getAttribute("href")).toBe(
+      "/settings/team",
     );
     expect(screen.queryByText("Agent API")).toBeNull();
     expect(screen.queryByPlaceholderText("github username")).toBeNull();
     expect(screen.queryByRole("button", { name: "Create token" })).toBeNull();
   });
 
-  it("shows team admin controls on the settings page for admins", () => {
+  it("shows personal agent tokens on My Settings for any member", () => {
+    mockedUseBuildStreamWorkspace.mockReturnValue({
+      ...adminWorkspace,
+      role: "member",
+      canManageTeam: false,
+      workspace: {
+        access: "granted",
+        teamId: "teams:test" as never,
+        teamName: "BuildStream Dev",
+        role: "member",
+        viewer: {
+          userId: "test-user-1",
+          name: "Test User",
+          githubLogin: "ken-at-em",
+          email: "test@buildstream.local",
+        },
+      },
+    });
+    mockedUseQuery.mockReturnValueOnce([]);
+
+    render(<MySettingsApp />);
+
+    expect(screen.getByRole("heading", { name: "My Settings" })).not.toBeNull();
+    expect(screen.getByText("My Agent Tokens")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Create token" })).not.toBeNull();
+    expect(screen.queryByRole("link", { name: /team settings/i })).toBeNull();
+  });
+
+  it("shows team admin controls on the team settings page for admins", () => {
     mockedUseQuery
       .mockReturnValueOnce({
         members: [
@@ -131,16 +163,17 @@ describe("admin surfaces", () => {
       })
       .mockReturnValueOnce([]);
 
-    render(<SettingsApp />);
+    render(<TeamSettingsApp />);
 
     expect(screen.getByRole("heading", { name: "Team Settings" })).not.toBeNull();
     expect(screen.getByText("@ken-at-em")).not.toBeNull();
     expect(screen.getByText("@future-dev")).not.toBeNull();
     expect(screen.getByPlaceholderText("github username")).not.toBeNull();
-    expect(screen.getByRole("button", { name: "Create token" })).not.toBeNull();
+    expect(screen.getByText("Service Tokens")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Create token" })).toBeNull();
   });
 
-  it("blocks settings controls for non-admin members", () => {
+  it("blocks team settings controls for non-admin members", () => {
     mockedUseBuildStreamWorkspace.mockReturnValue({
       ...adminWorkspace,
       role: "member",
@@ -160,7 +193,7 @@ describe("admin surfaces", () => {
     });
     mockedUseQuery.mockReturnValue(undefined);
 
-    render(<SettingsApp />);
+    render(<TeamSettingsApp />);
 
     expect(screen.getByText("Admin access required")).not.toBeNull();
     expect(screen.queryByRole("button", { name: "Create token" })).toBeNull();

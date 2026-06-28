@@ -1,5 +1,5 @@
-import { SettingsApp } from "./settings-app";
+import { MySettingsApp } from "./my-settings-app";
 
 export default function SettingsPage() {
-  return <SettingsApp />;
+  return <MySettingsApp />;
 }

@@ -48,9 +48,9 @@ export async function POST(request: Request) {
         githubLogin: user.githubLogin,
       }),
     );
-    const result = await convex.mutation(api.cards.createAgentToken, {
+    const result = await convex.mutation(api.cards.createMyAgentToken, {
       teamId: body.teamId as Id<"teams">,
-      name: typeof body.name === "string" ? body.name : "Default agent token",
+      name: typeof body.name === "string" ? body.name : "My local agent",
       tokenHash: hashAgentToken(token),
       tokenPrefix: prefix,
       scopes: defaultAgentScopes,

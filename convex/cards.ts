@@ -44,6 +44,12 @@ type CardInput = {
 };
 type ProductionStatus = NonNullable<CardInput["productionStatus"]>;
 type AuthCtx = QueryCtx | MutationCtx;
+type AuthorizedAgent = {
+  token: Doc<"agentTokens">;
+  teamId: Id<"teams">;
+  actorId: string;
+  actorName: string;
+};
 
 function cleanText(value: string) {
   return value.trim().replace(/\s+/g, " ");
@@ -172,7 +178,7 @@ async function getAuthorizedAgentToken(
   ctx: MutationCtx,
   tokenHash: string,
   requiredScope: AgentScope,
-) {
+): Promise<AuthorizedAgent> {
   const token = await ctx.db
     .query("agentTokens")
     .withIndex("by_hash", (q) => q.eq("tokenHash", tokenHash))
@@ -197,7 +203,37 @@ async function getAuthorizedAgentToken(
     rateLimitCount: currentCount + 1,
   });
 
-  return token;
+  if (token.kind === "personal") {
+    if (!token.ownerUserId) {
+      throw new Error("Unauthorized agent token.");
+    }
+    const ownerId = ctx.db.normalizeId("users", token.ownerUserId);
+    const owner = ownerId ? await ctx.db.get(ownerId) : null;
+    if (!owner) {
+      throw new Error("Unauthorized agent token.");
+    }
+    const membership = await ctx.db
+      .query("teamMembers")
+      .withIndex("by_team_user", (q) => q.eq("teamId", token.teamId).eq("userId", owner._id))
+      .first();
+    if (!membership) {
+      throw new Error("Unauthorized agent token.");
+    }
+
+    return {
+      token,
+      teamId: token.teamId,
+      actorId: owner._id,
+      actorName: `${owner.name}'s agent`,
+    };
+  }
+
+  return {
+    token,
+    teamId: token.teamId,
+    actorId: token._id,
+    actorName: token.name,
+  };
 }
 
 function productionFields(input: CardInput) {
@@ -630,6 +666,34 @@ export const listAgentTokens = query({
       .order("desc")
       .collect();
 
+    return tokens
+      .filter((token) => token.kind !== "personal")
+      .map((token) => ({
+        tokenId: token._id,
+        name: token.name,
+        kind: token.kind ?? "team",
+        tokenPrefix: token.tokenPrefix ?? "legacy",
+        scopes: token.scopes ?? [],
+        createdAt: token.createdAt,
+        lastUsedAt: token.lastUsedAt,
+        revokedAt: token.revokedAt,
+      }));
+  },
+});
+
+export const listMyAgentTokens = query({
+  args: {
+    teamId: v.id("teams"),
+  },
+  handler: async (ctx, args) => {
+    const { user } = await requireMembership(ctx, args.teamId);
+
+    const tokens = await ctx.db
+      .query("agentTokens")
+      .withIndex("by_team_owner", (q) => q.eq("teamId", args.teamId).eq("ownerUserId", user._id))
+      .order("desc")
+      .collect();
+
     return tokens.map((token) => ({
       tokenId: token._id,
       name: token.name,
@@ -665,6 +729,43 @@ export const createAgentToken = mutation({
     const tokenId = await ctx.db.insert("agentTokens", {
       teamId: args.teamId,
       name: args.name.trim() || "Agent token",
+      kind: "team",
+      tokenHash: args.tokenHash,
+      tokenPrefix: args.tokenPrefix,
+      scopes: args.scopes,
+      createdByUserId: user._id,
+      createdAt: now,
+    });
+
+    return { tokenId };
+  },
+});
+
+export const createMyAgentToken = mutation({
+  args: {
+    teamId: v.id("teams"),
+    name: v.string(),
+    tokenHash: v.string(),
+    tokenPrefix: v.string(),
+    scopes: v.array(agentScope),
+  },
+  handler: async (ctx, args) => {
+    const { user } = await requireMembership(ctx, args.teamId);
+
+    const existingHash = await ctx.db
+      .query("agentTokens")
+      .withIndex("by_hash", (q) => q.eq("tokenHash", args.tokenHash))
+      .first();
+    if (existingHash) {
+      throw new Error("Token collision.");
+    }
+
+    const now = Date.now();
+    const tokenId = await ctx.db.insert("agentTokens", {
+      teamId: args.teamId,
+      name: args.name.trim() || "My local agent",
+      kind: "personal",
+      ownerUserId: user._id,
       tokenHash: args.tokenHash,
       tokenPrefix: args.tokenPrefix,
       scopes: args.scopes,
@@ -685,7 +786,29 @@ export const revokeAgentToken = mutation({
     await requireMembership(ctx, args.teamId, ["owner", "admin"]);
     const token = await ctx.db.get(args.tokenId);
 
-    if (!token || token.teamId !== args.teamId) {
+    if (!token || token.teamId !== args.teamId || token.kind === "personal") {
+      throw new Error("Agent token not found.");
+    }
+
+    await ctx.db.patch(args.tokenId, { revokedAt: Date.now() });
+  },
+});
+
+export const revokeMyAgentToken = mutation({
+  args: {
+    teamId: v.id("teams"),
+    tokenId: v.id("agentTokens"),
+  },
+  handler: async (ctx, args) => {
+    const { user } = await requireMembership(ctx, args.teamId);
+    const token = await ctx.db.get(args.tokenId);
+
+    if (
+      !token ||
+      token.teamId !== args.teamId ||
+      token.kind !== "personal" ||
+      token.ownerUserId !== user._id
+    ) {
       throw new Error("Agent token not found.");
     }
 
@@ -700,12 +823,12 @@ export const createCardFromAgent = mutation({
     ...cardInput,
   },
   handler: async (ctx, args) => {
-    const token = await getAuthorizedAgentToken(ctx, args.tokenHash, "cards:create");
+    const agent = await getAuthorizedAgentToken(ctx, args.tokenHash, "cards:create");
 
     const now = Date.now();
     const production = productionFields(args);
     return ctx.db.insert("cards", {
-      teamId: token.teamId,
+      teamId: agent.teamId,
       type: args.type,
       summary: requireSummary(args.summary),
       body: cleanOptionalText(args.body, 2_000),
@@ -717,8 +840,8 @@ export const createCardFromAgent = mutation({
       severity: production.severity,
       workaround: production.workaround,
       createdByType: "agent",
-      createdById: token._id,
-      createdByName: cleanOptionalText(args.agentName, 80) || token.name,
+      createdById: agent.actorId,
+      createdByName: cleanOptionalText(args.agentName, 80) || agent.actorName,
       createdAt: now,
       updatedAt: now,
     });
@@ -731,10 +854,10 @@ export const listCardsForAgent = mutation({
     filter: v.optional(v.union(cardType, cardStatus, v.literal("all"))),
   },
   handler: async (ctx, args) => {
-    const token = await getAuthorizedAgentToken(ctx, args.tokenHash, "cards:read");
+    const agent = await getAuthorizedAgentToken(ctx, args.tokenHash, "cards:read");
     const cards = await ctx.db
       .query("cards")
-      .withIndex("by_team", (q) => q.eq("teamId", token.teamId))
+      .withIndex("by_team", (q) => q.eq("teamId", agent.teamId))
       .order("desc")
       .collect();
 
@@ -768,9 +891,9 @@ export const updateCardFromAgent = mutation({
     workaround: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const token = await getAuthorizedAgentToken(ctx, args.tokenHash, "cards:update");
+    const agent = await getAuthorizedAgentToken(ctx, args.tokenHash, "cards:update");
     const card = await ctx.db.get(args.cardId);
-    if (!card || card.teamId !== token.teamId) {
+    if (!card || card.teamId !== agent.teamId) {
       throw new Error("Card not found.");
     }
 
@@ -810,11 +933,11 @@ export const addCommentFromAgent = mutation({
     body: v.string(),
   },
   handler: async (ctx, args) => {
-    const token = await getAuthorizedAgentToken(ctx, args.tokenHash, "comments:create");
+    const agent = await getAuthorizedAgentToken(ctx, args.tokenHash, "comments:create");
     const card = await ctx.db.get(args.cardId);
     const body = args.body.trim();
 
-    if (!card || card.teamId !== token.teamId) {
+    if (!card || card.teamId !== agent.teamId) {
       throw new Error("Card not found.");
     }
     if (!body) {
@@ -825,11 +948,11 @@ export const addCommentFromAgent = mutation({
     }
 
     return ctx.db.insert("comments", {
-      teamId: token.teamId,
+      teamId: agent.teamId,
       cardId: args.cardId,
       body,
-      createdById: token._id,
-      createdByName: cleanOptionalText(args.agentName, 80) || token.name,
+      createdById: agent.actorId,
+      createdByName: cleanOptionalText(args.agentName, 80) || agent.actorName,
       createdAt: Date.now(),
     });
   },

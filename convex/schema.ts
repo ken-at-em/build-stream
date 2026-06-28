@@ -125,6 +125,8 @@ export default defineSchema({
   agentTokens: defineTable({
     teamId: v.id("teams"),
     name: v.string(),
+    kind: v.optional(v.union(v.literal("personal"), v.literal("team"))),
+    ownerUserId: v.optional(v.string()),
     tokenHash: v.optional(v.string()),
     tokenPrefix: v.optional(v.string()),
     scopes: v.optional(v.array(agentScope)),
@@ -137,5 +139,6 @@ export default defineSchema({
     tokenSecret: v.optional(v.string()),
   })
     .index("by_team", ["teamId"])
+    .index("by_team_owner", ["teamId", "ownerUserId"])
     .index("by_hash", ["tokenHash"]),
 });

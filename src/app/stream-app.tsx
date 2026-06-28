@@ -307,14 +307,22 @@ export function BuildStreamApp() {
 
           <Separator className="my-6" />
 
-          {canManageTeam ? (
+          <div className="space-y-1">
             <Button asChild variant="ghost" className="w-full justify-start">
               <Link href="/settings">
                 <Settings size={16} />
-                Team Settings
+                My Settings
               </Link>
             </Button>
-          ) : null}
+            {canManageTeam ? (
+              <Button asChild variant="ghost" className="w-full justify-start">
+                <Link href="/settings/team">
+                  <Settings size={16} />
+                  Team Settings
+                </Link>
+              </Button>
+            ) : null}
+          </div>
         </aside>
 
         <section className="min-w-0 border-b px-4 py-5 lg:border-b-0 lg:border-r lg:px-6">
