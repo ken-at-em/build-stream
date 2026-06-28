@@ -2,7 +2,7 @@
 
 import { ConvexProviderWithAuth, ConvexReactClient } from "convex/react";
 import { SessionProvider, useSession } from "next-auth/react";
-import { ReactNode, useMemo } from "react";
+import { ReactNode, useCallback, useMemo } from "react";
 
 export function ConvexClientProvider({ children }: { children: ReactNode }) {
   const convexUrl = process.env.NEXT_PUBLIC_CONVEX_URL;
@@ -54,14 +54,19 @@ function AuthenticatedConvexProvider({
 function useConvexAuthFromSession() {
   const { status } = useSession();
 
-  return {
-    isLoading: status === "loading",
-    isAuthenticated: status === "authenticated",
-    fetchAccessToken: async () => {
-      const response = await fetch("/api/auth/convex-token");
-      if (!response.ok) return null;
-      const payload = (await response.json()) as { token?: string };
-      return payload.token ?? null;
-    },
-  };
+  const fetchAccessToken = useCallback(async () => {
+    const response = await fetch("/api/auth/convex-token");
+    if (!response.ok) return null;
+    const payload = (await response.json()) as { token?: string };
+    return payload.token ?? null;
+  }, []);
+
+  return useMemo(
+    () => ({
+      isLoading: status === "loading",
+      isAuthenticated: status === "authenticated",
+      fetchAccessToken,
+    }),
+    [fetchAccessToken, status],
+  );
 }
