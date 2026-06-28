@@ -33,6 +33,12 @@ export const agentScope = v.union(
   v.literal("comments:create"),
 );
 
+export const teamRole = v.union(
+  v.literal("owner"),
+  v.literal("admin"),
+  v.literal("member"),
+);
+
 export const linkValue = v.object({
   type: v.union(v.literal("pr"), v.literal("file"), v.literal("branch"), v.literal("url")),
   label: v.optional(v.string()),
@@ -41,6 +47,18 @@ export const linkValue = v.object({
 });
 
 export default defineSchema({
+  users: defineTable({
+    authSubject: v.string(),
+    githubLogin: v.string(),
+    email: v.optional(v.string()),
+    name: v.string(),
+    avatarUrl: v.optional(v.string()),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_auth_subject", ["authSubject"])
+    .index("by_github_login", ["githubLogin"]),
+
   teams: defineTable({
     name: v.string(),
     slug: v.string(),
@@ -51,12 +69,25 @@ export default defineSchema({
     teamId: v.id("teams"),
     userId: v.string(),
     name: v.string(),
-    role: v.union(v.literal("owner"), v.literal("member")),
+    role: teamRole,
     createdAt: v.number(),
   })
     .index("by_user", ["userId"])
     .index("by_team", ["teamId"])
     .index("by_team_user", ["teamId", "userId"]),
+
+  teamInvites: defineTable({
+    teamId: v.id("teams"),
+    githubLogin: v.string(),
+    role: teamRole,
+    invitedByUserId: v.string(),
+    acceptedAt: v.optional(v.number()),
+    revokedAt: v.optional(v.number()),
+    createdAt: v.number(),
+  })
+    .index("by_team", ["teamId"])
+    .index("by_login", ["githubLogin"])
+    .index("by_team_login", ["teamId", "githubLogin"]),
 
   cards: defineTable({
     teamId: v.id("teams"),

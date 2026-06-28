@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery } from "convex/react";
+import { signIn, signOut, useSession } from "next-auth/react";
 import {
   AlertTriangle,
   Bot,
@@ -10,11 +11,13 @@ import {
   Copy,
   Flame,
   GitBranch,
+  LogOut,
   MessageSquare,
   Radio,
   Send,
   ShipWheel,
   Sparkles,
+  UserPlus,
 } from "lucide-react";
 
 import { api } from "../../convex/_generated/api";
@@ -22,6 +25,7 @@ import type { Id } from "../../convex/_generated/dataModel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
@@ -38,11 +42,31 @@ type CardType = "checkpoint" | "risk" | "question" | "reviewable" | "production"
 type Filter = "all" | CardType | "resolved";
 type ProductionStatus = "investigating" | "mitigating" | "monitoring" | "resolved";
 type Severity = "none" | "sev1" | "sev2" | "sev3";
-
-const devUser = {
-  userId: "dev-user",
-  userName: "Ken",
-};
+type TeamRole = "owner" | "admin" | "member";
+type Workspace =
+  | {
+      access: "granted";
+      teamId: Id<"teams">;
+      teamName: string;
+      role: TeamRole;
+      viewer: {
+        userId: string;
+        name: string;
+        githubLogin: string;
+        email?: string;
+        avatarUrl?: string;
+      };
+    }
+  | {
+      access: "denied";
+      viewer: {
+        userId: string;
+        name: string;
+        githubLogin: string;
+        email?: string;
+        avatarUrl?: string;
+      };
+    };
 
 const cardMeta: Record<
   CardType,
@@ -116,8 +140,8 @@ const severityLabels: Record<Severity, string> = {
 };
 
 export function BuildStreamApp() {
-  const [teamId, setTeamId] = useState<Id<"teams"> | null>(null);
-  const [teamName, setTeamName] = useState("BuildStream Dev");
+  const { data: session, status: sessionStatus } = useSession();
+  const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
   const [selectedCardId, setSelectedCardId] = useState<Id<"cards"> | null>(null);
   const [summary, setSummary] = useState("");
@@ -126,6 +150,8 @@ export function BuildStreamApp() {
   const [severity, setSeverity] = useState<Severity>("none");
   const [workaround, setWorkaround] = useState("");
   const [comment, setComment] = useState("");
+  const [inviteLogin, setInviteLogin] = useState("");
+  const [inviteRole, setInviteRole] = useState<"member" | "admin">("member");
   const [agentToken, setAgentToken] = useState<string | null>(null);
   const [copiedAgentCurl, setCopiedAgentCurl] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -136,21 +162,32 @@ export function BuildStreamApp() {
   const updateProductionCard = useMutation(api.cards.updateProductionCard);
   const addComment = useMutation(api.cards.addComment);
   const revokeAgentToken = useMutation(api.cards.revokeAgentToken);
+  const createTeamInvite = useMutation(api.cards.createTeamInvite);
+  const revokeTeamInvite = useMutation(api.cards.revokeTeamInvite);
 
   useEffect(() => {
+    if (sessionStatus !== "authenticated") {
+      return;
+    }
+
     let cancelled = false;
-    ensureWorkspace(devUser)
+    ensureWorkspace({})
       .then((workspace) => {
         if (cancelled) return;
-        setTeamId(workspace.teamId);
-        setTeamName(workspace.teamName);
+        setWorkspace(workspace as Workspace);
       })
       .catch((cause) => setError(errorMessage(cause)));
 
     return () => {
       cancelled = true;
     };
-  }, [ensureWorkspace]);
+  }, [ensureWorkspace, sessionStatus]);
+
+  const teamId = workspace?.access === "granted" ? workspace.teamId : null;
+  const teamName = workspace?.access === "granted" ? workspace.teamName : "BuildStream";
+  const viewer = workspace?.viewer;
+  const role = workspace?.access === "granted" ? workspace.role : null;
+  const canManageTeam = role === "owner" || role === "admin";
 
   const cards = useQuery(
     api.cards.listCards,
@@ -164,7 +201,8 @@ export function BuildStreamApp() {
 
   const agentCurl = useMemo(() => {
     if (!agentToken) return "";
-    return `curl -X POST http://localhost:3000/api/agent/cards \\
+    const origin = typeof window === "undefined" ? "http://localhost:3000" : window.location.origin;
+    return `curl -X POST ${origin}/api/agent/cards \\
   -H "Authorization: Bearer ${agentToken}" \\
   -H "Content-Type: application/json" \\
   -d '{"type":"risk","summary":"Migration touches trigger behavior; need DB review.","agentName":"Codex"}'`;
@@ -176,7 +214,11 @@ export function BuildStreamApp() {
   );
   const agentTokens = useQuery(
     api.cards.listAgentTokens,
-    teamId ? { teamId, userId: devUser.userId } : "skip",
+    teamId && canManageTeam ? { teamId } : "skip",
+  );
+  const teamAdmin = useQuery(
+    api.cards.listTeamAdmin,
+    teamId && canManageTeam ? { teamId } : "skip",
   );
 
   const extractedPrUrl = useMemo(() => extractPrUrl(summary), [summary]);
@@ -215,7 +257,6 @@ export function BuildStreamApp() {
     try {
       const cardId = await createCard({
         teamId,
-        ...devUser,
         type,
         summary,
         body: undefined,
@@ -246,7 +287,6 @@ export function BuildStreamApp() {
       await addComment({
         teamId,
         cardId: selectedCard._id,
-        ...devUser,
         body: comment,
       });
       setComment("");
@@ -262,7 +302,6 @@ export function BuildStreamApp() {
       await updateCardStatus({
         teamId,
         cardId: selectedCard._id,
-        userId: devUser.userId,
         status: selectedCard.status === "open" ? "resolved" : "open",
       });
     } catch (cause) {
@@ -281,7 +320,6 @@ export function BuildStreamApp() {
       await updateProductionCard({
         teamId,
         cardId: selectedCard._id,
-        userId: devUser.userId,
         productionStatus: next.productionStatus ?? selectedCard.productionStatus ?? "investigating",
         severity: next.severity ?? selectedCard.severity ?? "none",
         workaround: next.workaround ?? selectedCard.workaround ?? "",
@@ -300,7 +338,6 @@ export function BuildStreamApp() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           teamId,
-          ...devUser,
           name: "Default agent token",
         }),
       });
@@ -320,9 +357,35 @@ export function BuildStreamApp() {
     try {
       await revokeAgentToken({
         teamId,
-        userId: devUser.userId,
         tokenId,
       });
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  }
+
+  async function submitInvite(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!teamId || !inviteLogin.trim()) return;
+    setError(null);
+    try {
+      await createTeamInvite({
+        teamId,
+        githubLogin: inviteLogin,
+        role: inviteRole,
+      });
+      setInviteLogin("");
+      setInviteRole("member");
+    } catch (cause) {
+      setError(errorMessage(cause));
+    }
+  }
+
+  async function revokeInvite(inviteId: Id<"teamInvites">) {
+    if (!teamId) return;
+    setError(null);
+    try {
+      await revokeTeamInvite({ teamId, inviteId });
     } catch (cause) {
       setError(errorMessage(cause));
     }
@@ -340,17 +403,52 @@ export function BuildStreamApp() {
     }
   }
 
+  if (sessionStatus === "loading") {
+    return <CenteredState title="Loading BuildStream" body="Checking your GitHub session..." />;
+  }
+
+  if (sessionStatus === "unauthenticated") {
+    return <SignInScreen />;
+  }
+
+  if (!workspace) {
+    return <CenteredState title="Loading workspace" body="Checking your team access..." />;
+  }
+
+  if (workspace.access === "denied") {
+    return <AccessDeniedScreen viewer={workspace.viewer} />;
+  }
+
+  const viewerInitial = (viewer?.name ?? session?.user?.name ?? "U").charAt(0).toUpperCase();
+
   return (
     <main className="min-h-screen bg-background text-foreground">
       <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[240px_minmax(0,1fr)_360px]">
         <aside className="border-b bg-sidebar px-5 py-5 text-sidebar-foreground lg:border-b-0 lg:border-r">
-          <div className="flex items-center gap-2">
-            <div className="flex size-9 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
-              <GitBranch size={18} />
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2">
+              <div className="flex size-9 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
+                <GitBranch size={18} />
+              </div>
+              <div>
+                <h1 className="text-lg font-semibold">BuildStream</h1>
+                <p className="text-xs text-muted-foreground">{teamName}</p>
+              </div>
             </div>
-            <div>
-              <h1 className="text-lg font-semibold">BuildStream</h1>
-              <p className="text-xs text-muted-foreground">{teamName}</p>
+            <Button type="button" variant="ghost" size="icon" onClick={() => signOut()}>
+              <LogOut size={15} />
+            </Button>
+          </div>
+
+          <div className="mt-5 flex items-center gap-3 rounded-lg border bg-background p-2">
+            <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary text-sm font-semibold text-primary-foreground">
+              {viewerInitial}
+            </div>
+            <div className="min-w-0">
+              <p className="truncate text-sm font-medium">{viewer?.name}</p>
+              <p className="truncate text-xs text-muted-foreground">
+                @{viewer?.githubLogin} · {role}
+              </p>
             </div>
           </div>
 
@@ -370,6 +468,7 @@ export function BuildStreamApp() {
 
           <Separator className="my-6" />
 
+          {canManageTeam ? (
           <Card size="sm">
             <CardHeader>
               <CardTitle className="flex items-center gap-2 text-sm">
@@ -439,6 +538,90 @@ export function BuildStreamApp() {
               ) : null}
             </CardContent>
           </Card>
+          ) : null}
+
+          {canManageTeam ? (
+            <Card size="sm" className="mt-4">
+              <CardHeader>
+                <CardTitle className="flex items-center gap-2 text-sm">
+                  <UserPlus size={16} />
+                  Team
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3">
+                <form onSubmit={submitInvite} className="space-y-2">
+                  <Input
+                    value={inviteLogin}
+                    onChange={(event) => setInviteLogin(event.target.value)}
+                    placeholder="github username"
+                  />
+                  <div className="grid grid-cols-[1fr_auto] gap-2">
+                    <Select
+                      value={inviteRole}
+                      onValueChange={(value) => setInviteRole(value as "member" | "admin")}
+                    >
+                      <SelectTrigger>
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="member">Member</SelectItem>
+                        <SelectItem value="admin">Admin</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <Button disabled={!inviteLogin.trim()}>Invite</Button>
+                  </div>
+                </form>
+                {teamAdmin ? (
+                  <div className="space-y-3 border-t pt-3">
+                    <div>
+                      <p className="text-xs font-medium">Members</p>
+                      <div className="mt-2 space-y-1">
+                        {teamAdmin.members.map((member) => (
+                          <div
+                            key={member.membershipId}
+                            className="flex items-center justify-between gap-2 text-xs"
+                          >
+                            <span className="truncate">
+                              {member.githubLogin ? `@${member.githubLogin}` : member.name}
+                            </span>
+                            <Badge variant="secondary">{member.role}</Badge>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div>
+                      <p className="text-xs font-medium">Invites</p>
+                      <div className="mt-2 space-y-1">
+                        {teamAdmin.invites.filter((invite) => !invite.acceptedAt && !invite.revokedAt)
+                          .length ? (
+                          teamAdmin.invites
+                            .filter((invite) => !invite.acceptedAt && !invite.revokedAt)
+                            .map((invite) => (
+                              <div
+                                key={invite.inviteId}
+                                className="flex items-center justify-between gap-2 text-xs"
+                              >
+                                <span className="truncate">@{invite.githubLogin}</span>
+                                <Button
+                                  type="button"
+                                  variant="ghost"
+                                  size="xs"
+                                  onClick={() => revokeInvite(invite.inviteId)}
+                                >
+                                  Revoke
+                                </Button>
+                              </div>
+                            ))
+                        ) : (
+                          <p className="text-xs text-muted-foreground">No pending invites.</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                ) : null}
+              </CardContent>
+            </Card>
+          ) : null}
         </aside>
 
         <section className="min-w-0 border-b px-4 py-5 lg:border-b-0 lg:border-r lg:px-6">
@@ -448,7 +631,7 @@ export function BuildStreamApp() {
                 <form onSubmit={submitCard} className="space-y-4">
                   <div className="flex gap-3">
                     <div className="mt-1 flex size-9 shrink-0 items-center justify-center rounded-full bg-primary text-sm font-semibold text-primary-foreground">
-                      K
+                      {viewerInitial}
                     </div>
                     <div className="min-w-0 flex-1">
                       <Textarea
@@ -706,6 +889,65 @@ export function BuildStreamApp() {
           )}
         </aside>
       </div>
+    </main>
+  );
+}
+
+function SignInScreen() {
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-background px-6 text-foreground">
+      <Card className="w-full max-w-sm">
+        <CardContent className="space-y-4 text-center">
+          <div className="mx-auto flex size-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+            <GitBranch size={19} />
+          </div>
+          <div>
+            <h1 className="text-xl font-semibold">BuildStream</h1>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Sign in with GitHub to enter your team stream.
+            </p>
+          </div>
+          <Button type="button" className="w-full" onClick={() => signIn("github")}>
+            Sign in with GitHub
+          </Button>
+        </CardContent>
+      </Card>
+    </main>
+  );
+}
+
+function AccessDeniedScreen({ viewer }: { viewer: Workspace["viewer"] }) {
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-background px-6 text-foreground">
+      <Card className="w-full max-w-sm">
+        <CardContent className="space-y-4 text-center">
+          <Badge variant="secondary" className="mx-auto">
+            @{viewer.githubLogin}
+          </Badge>
+          <div>
+            <h1 className="text-xl font-semibold">Invite required</h1>
+            <p className="mt-2 text-sm text-muted-foreground">
+              Ask a BuildStream owner or admin to invite your GitHub username.
+            </p>
+          </div>
+          <Button type="button" variant="outline" className="w-full" onClick={() => signOut()}>
+            Sign out
+          </Button>
+        </CardContent>
+      </Card>
+    </main>
+  );
+}
+
+function CenteredState({ title, body }: { title: string; body: string }) {
+  return (
+    <main className="flex min-h-screen items-center justify-center bg-background px-6 text-foreground">
+      <Card className="w-full max-w-sm">
+        <CardContent>
+          <h1 className="text-lg font-semibold">{title}</h1>
+          <p className="mt-2 text-sm text-muted-foreground">{body}</p>
+        </CardContent>
+      </Card>
     </main>
   );
 }

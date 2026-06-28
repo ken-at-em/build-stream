@@ -1,22 +1,23 @@
 import { ConvexHttpClient } from "convex/browser";
+import { getServerSession } from "next-auth";
 import { api } from "../../../../../convex/_generated/api";
 import type { Id } from "../../../../../convex/_generated/dataModel";
+import { authOptions } from "@/auth";
 import {
   defaultAgentScopes,
   generateAgentToken,
   getConvexUrl,
   hashAgentToken,
-  isTokenManagementAllowed,
 } from "@/lib/agent-api";
+import { signConvexJwt } from "@/lib/convex-auth-token";
 
 export const dynamic = "force-dynamic";
 
 export async function POST(request: Request) {
-  if (!isTokenManagementAllowed()) {
-    return Response.json(
-      { error: "Token management requires authenticated production wiring." },
-      { status: 403 },
-    );
+  const session = await getServerSession(authOptions);
+  const user = session?.user;
+  if (!user?.id || !user.githubLogin) {
+    return Response.json({ error: "Authentication required." }, { status: 401 });
   }
 
   const convexUrl = getConvexUrl();
@@ -38,10 +39,17 @@ export async function POST(request: Request) {
   const convex = new ConvexHttpClient(convexUrl);
 
   try {
+    convex.setAuth(
+      await signConvexJwt({
+        subject: user.id,
+        name: user.name,
+        email: user.email,
+        picture: user.image,
+        githubLogin: user.githubLogin,
+      }),
+    );
     const result = await convex.mutation(api.cards.createAgentToken, {
       teamId: body.teamId as Id<"teams">,
-      userId: typeof body.userId === "string" ? body.userId : "dev-user",
-      userName: typeof body.userName === "string" ? body.userName : "Ken",
       name: typeof body.name === "string" ? body.name : "Default agent token",
       tokenHash: hashAgentToken(token),
       tokenPrefix: prefix,

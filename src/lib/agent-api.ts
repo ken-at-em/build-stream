@@ -106,10 +106,6 @@ function sanitizeAgentError(message: string) {
   return "Agent request failed.";
 }
 
-export function isTokenManagementAllowed() {
-  return process.env.NODE_ENV !== "production" || process.env.ALLOW_DEV_TOKEN_MANAGEMENT === "true";
-}
-
 export function generateAgentToken() {
   const prefix = randomBytes(5).toString("hex");
   const secret = randomBytes(32).toString("base64url");

@@ -8,17 +8,13 @@ import {
   productionStatus,
   severity,
 } from "./schema";
-import type { Doc } from "./_generated/dataModel";
-import type { MutationCtx } from "./_generated/server";
+import type { Doc, Id } from "./_generated/dataModel";
+import type { MutationCtx, QueryCtx } from "./_generated/server";
 
 const defaultTeamSlug = "buildstream-dev";
+const defaultTeamName = "BuildStream Dev";
 const rateLimitWindowMs = 60_000;
 const rateLimitMaxRequests = 60;
-
-const userArgs = {
-  userId: v.string(),
-  userName: v.string(),
-};
 
 const cardInput = {
   type: cardType,
@@ -31,6 +27,23 @@ const cardInput = {
   severity: v.optional(severity),
   workaround: v.optional(v.string()),
 };
+
+const inviteRole = v.union(v.literal("admin"), v.literal("member"));
+
+type AgentScope =
+  | "cards:create"
+  | "cards:read"
+  | "cards:update"
+  | "comments:create";
+type TeamRole = "owner" | "admin" | "member";
+type CardInput = {
+  type: "checkpoint" | "risk" | "question" | "reviewable" | "production" | "shipped";
+  productionStatus?: "investigating" | "mitigating" | "monitoring" | "resolved";
+  severity?: "none" | "sev1" | "sev2" | "sev3";
+  workaround?: string;
+};
+type ProductionStatus = NonNullable<CardInput["productionStatus"]>;
+type AuthCtx = QueryCtx | MutationCtx;
 
 function cleanText(value: string) {
   return value.trim().replace(/\s+/g, " ");
@@ -56,23 +69,104 @@ function cleanOptionalText(value: string | undefined, maxLength: number) {
   return cleaned;
 }
 
+function normalizeGitHubLogin(value: string | undefined) {
+  const normalized = value?.trim().replace(/^@/, "").toLowerCase();
+  return normalized || undefined;
+}
+
 function hasScope(token: Doc<"agentTokens">, scope: AgentScope) {
   return token.scopes?.includes(scope) ?? false;
 }
 
-type AgentScope =
-  | "cards:create"
-  | "cards:read"
-  | "cards:update"
-  | "comments:create";
+async function getIdentity(ctx: AuthCtx) {
+  const identity = await ctx.auth.getUserIdentity();
+  if (!identity) {
+    throw new Error("Authentication required.");
+  }
+  const githubLogin = normalizeGitHubLogin(
+    typeof identity.githubLogin === "string"
+      ? identity.githubLogin
+      : identity.preferredUsername ?? identity.nickname,
+  );
+  if (!githubLogin) {
+    throw new Error("GitHub login is required.");
+  }
+  return { identity, githubLogin };
+}
 
-type CardInput = {
-  type: "checkpoint" | "risk" | "question" | "reviewable" | "production" | "shipped";
-  productionStatus?: "investigating" | "mitigating" | "monitoring" | "resolved";
-  severity?: "none" | "sev1" | "sev2" | "sev3";
-  workaround?: string;
-};
-type ProductionStatus = NonNullable<CardInput["productionStatus"]>;
+async function getCurrentUser(ctx: AuthCtx) {
+  const { identity } = await getIdentity(ctx);
+  const user = await ctx.db
+    .query("users")
+    .withIndex("by_auth_subject", (q) => q.eq("authSubject", identity.subject))
+    .first();
+  if (!user) {
+    throw new Error("Workspace is not initialized for this user.");
+  }
+  return user;
+}
+
+async function upsertCurrentUser(ctx: MutationCtx) {
+  const { identity, githubLogin } = await getIdentity(ctx);
+  const now = Date.now();
+  const existing = await ctx.db
+    .query("users")
+    .withIndex("by_auth_subject", (q) => q.eq("authSubject", identity.subject))
+    .first();
+  const name = cleanOptionalText(identity.name, 120) ?? githubLogin;
+
+  if (existing) {
+    await ctx.db.patch(existing._id, {
+      githubLogin,
+      email: cleanOptionalText(identity.email, 320),
+      name,
+      avatarUrl: cleanOptionalText(identity.pictureUrl, 1_000),
+      updatedAt: now,
+    });
+    return {
+      ...(await ctx.db.get(existing._id)),
+      githubLogin,
+      email: cleanOptionalText(identity.email, 320),
+      name,
+      avatarUrl: cleanOptionalText(identity.pictureUrl, 1_000),
+      updatedAt: now,
+    } as Doc<"users">;
+  }
+
+  const userId = await ctx.db.insert("users", {
+    authSubject: identity.subject,
+    githubLogin,
+    email: cleanOptionalText(identity.email, 320),
+    name,
+    avatarUrl: cleanOptionalText(identity.pictureUrl, 1_000),
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  const user = await ctx.db.get(userId);
+  if (!user) {
+    throw new Error("Unable to create user.");
+  }
+  return user;
+}
+
+async function requireMembership(
+  ctx: AuthCtx,
+  teamId: Id<"teams">,
+  allowedRoles?: TeamRole[],
+) {
+  const user = await getCurrentUser(ctx);
+  const membership = await ctx.db
+    .query("teamMembers")
+    .withIndex("by_team_user", (q) => q.eq("teamId", teamId).eq("userId", user._id))
+    .first();
+
+  if (!membership || (allowedRoles && !allowedRoles.includes(membership.role))) {
+    throw new Error("You are not authorized for this team.");
+  }
+
+  return { user, membership };
+}
 
 async function getAuthorizedAgentToken(
   ctx: MutationCtx,
@@ -125,9 +219,7 @@ function productionFields(input: CardInput) {
   };
 }
 
-function baseStatusForProductionStatus(
-  nextProductionStatus: ProductionStatus,
-) {
+function baseStatusForProductionStatus(nextProductionStatus: ProductionStatus) {
   return nextProductionStatus === "resolved" ? "resolved" : "open";
 }
 
@@ -135,12 +227,23 @@ function productionStatusForBaseStatus(status: "open" | "resolved"): ProductionS
   return status === "resolved" ? "resolved" : "investigating";
 }
 
+function viewer(user: Doc<"users">) {
+  return {
+    userId: user._id,
+    name: user.name,
+    githubLogin: user.githubLogin,
+    email: user.email,
+    avatarUrl: user.avatarUrl,
+  };
+}
+
 export const ensureWorkspace = mutation({
-  args: userArgs,
-  handler: async (ctx, args) => {
+  args: {},
+  handler: async (ctx) => {
+    const user = await upsertCurrentUser(ctx);
     const existingMembership = await ctx.db
       .query("teamMembers")
-      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .withIndex("by_user", (q) => q.eq("userId", user._id))
       .first();
 
     if (existingMembership) {
@@ -148,7 +251,13 @@ export const ensureWorkspace = mutation({
       if (!team) {
         throw new Error("Team membership points at a missing team.");
       }
-      return { teamId: team._id, teamName: team.name };
+      return {
+        access: "granted" as const,
+        viewer: viewer(user),
+        teamId: team._id,
+        teamName: team.name,
+        role: existingMembership.role,
+      };
     }
 
     const now = Date.now();
@@ -156,49 +265,182 @@ export const ensureWorkspace = mutation({
       .query("teams")
       .withIndex("by_slug", (q) => q.eq("slug", defaultTeamSlug))
       .first();
+    const bootstrapLogin = normalizeGitHubLogin(process.env.BUILDSTREAM_BOOTSTRAP_GITHUB_LOGIN);
 
-    const teamId =
-      existingTeam?._id ??
-      (await ctx.db.insert("teams", {
-        name: "BuildStream Dev",
+    if (!existingTeam) {
+      if (user.githubLogin !== bootstrapLogin) {
+        return { access: "denied" as const, viewer: viewer(user) };
+      }
+      const teamId = await ctx.db.insert("teams", {
+        name: defaultTeamName,
         slug: defaultTeamSlug,
         createdAt: now,
-      }));
+      });
+      await ctx.db.insert("teamMembers", {
+        teamId,
+        userId: user._id,
+        name: user.name,
+        role: "owner",
+        createdAt: now,
+      });
+      return {
+        access: "granted" as const,
+        viewer: viewer(user),
+        teamId,
+        teamName: defaultTeamName,
+        role: "owner" as const,
+      };
+    }
+
+    if (user.githubLogin === bootstrapLogin) {
+      await ctx.db.insert("teamMembers", {
+        teamId: existingTeam._id,
+        userId: user._id,
+        name: user.name,
+        role: "owner",
+        createdAt: now,
+      });
+      return {
+        access: "granted" as const,
+        viewer: viewer(user),
+        teamId: existingTeam._id,
+        teamName: existingTeam.name,
+        role: "owner" as const,
+      };
+    }
+
+    const invite = await ctx.db
+      .query("teamInvites")
+      .withIndex("by_team_login", (q) =>
+        q.eq("teamId", existingTeam._id).eq("githubLogin", user.githubLogin),
+      )
+      .first();
+
+    if (!invite || invite.acceptedAt || invite.revokedAt) {
+      return { access: "denied" as const, viewer: viewer(user) };
+    }
 
     await ctx.db.insert("teamMembers", {
-      teamId,
-      userId: args.userId,
-      name: args.userName,
-      role: "owner",
+      teamId: existingTeam._id,
+      userId: user._id,
+      name: user.name,
+      role: invite.role,
       createdAt: now,
     });
+    await ctx.db.patch(invite._id, { acceptedAt: now });
 
-    return { teamId, teamName: existingTeam?.name ?? "BuildStream Dev" };
+    return {
+      access: "granted" as const,
+      viewer: viewer(user),
+      teamId: existingTeam._id,
+      teamName: existingTeam.name,
+      role: invite.role,
+    };
   },
 });
 
-export const listTeams = query({
-  args: { userId: v.string() },
+export const listTeamAdmin = query({
+  args: { teamId: v.id("teams") },
   handler: async (ctx, args) => {
+    await requireMembership(ctx, args.teamId, ["owner", "admin"]);
+
     const memberships = await ctx.db
       .query("teamMembers")
-      .withIndex("by_user", (q) => q.eq("userId", args.userId))
+      .withIndex("by_team", (q) => q.eq("teamId", args.teamId))
+      .collect();
+    const invites = await ctx.db
+      .query("teamInvites")
+      .withIndex("by_team", (q) => q.eq("teamId", args.teamId))
       .collect();
 
-    const teams = await Promise.all(
+    const members = await Promise.all(
       memberships.map(async (membership) => {
-        const team = await ctx.db.get(membership.teamId);
-        return team
-          ? {
-              teamId: team._id,
-              teamName: team.name,
-              role: membership.role,
-            }
-          : null;
+        const normalizedUserId = ctx.db.normalizeId("users", membership.userId);
+        const user = normalizedUserId ? await ctx.db.get(normalizedUserId) : null;
+        return {
+          membershipId: membership._id,
+          userId: membership.userId,
+          name: user?.name ?? membership.name,
+          githubLogin: user?.githubLogin,
+          role: membership.role,
+          createdAt: membership.createdAt,
+        };
       }),
     );
 
-    return teams.filter((team) => team !== null);
+    return {
+      members,
+      invites: invites.map((invite) => ({
+        inviteId: invite._id,
+        githubLogin: invite.githubLogin,
+        role: invite.role,
+        acceptedAt: invite.acceptedAt,
+        revokedAt: invite.revokedAt,
+        createdAt: invite.createdAt,
+      })),
+    };
+  },
+});
+
+export const createTeamInvite = mutation({
+  args: {
+    teamId: v.id("teams"),
+    githubLogin: v.string(),
+    role: inviteRole,
+  },
+  handler: async (ctx, args) => {
+    const { user } = await requireMembership(ctx, args.teamId, ["owner", "admin"]);
+    const githubLogin = normalizeGitHubLogin(args.githubLogin);
+    if (!githubLogin) {
+      throw new Error("GitHub username is required.");
+    }
+
+    const existingMemberUser = await ctx.db
+      .query("users")
+      .withIndex("by_github_login", (q) => q.eq("githubLogin", githubLogin))
+      .first();
+    if (existingMemberUser) {
+      const existingMembership = await ctx.db
+        .query("teamMembers")
+        .withIndex("by_team_user", (q) =>
+          q.eq("teamId", args.teamId).eq("userId", existingMemberUser._id),
+        )
+        .first();
+      if (existingMembership) {
+        throw new Error("User is already a team member.");
+      }
+    }
+
+    const existingInvite = await ctx.db
+      .query("teamInvites")
+      .withIndex("by_team_login", (q) => q.eq("teamId", args.teamId).eq("githubLogin", githubLogin))
+      .first();
+    if (existingInvite && !existingInvite.acceptedAt && !existingInvite.revokedAt) {
+      throw new Error("Invite already exists.");
+    }
+
+    return ctx.db.insert("teamInvites", {
+      teamId: args.teamId,
+      githubLogin,
+      role: args.role,
+      invitedByUserId: user._id,
+      createdAt: Date.now(),
+    });
+  },
+});
+
+export const revokeTeamInvite = mutation({
+  args: {
+    teamId: v.id("teams"),
+    inviteId: v.id("teamInvites"),
+  },
+  handler: async (ctx, args) => {
+    await requireMembership(ctx, args.teamId, ["owner", "admin"]);
+    const invite = await ctx.db.get(args.inviteId);
+    if (!invite || invite.teamId !== args.teamId || invite.acceptedAt) {
+      throw new Error("Invite not found.");
+    }
+    await ctx.db.patch(args.inviteId, { revokedAt: Date.now() });
   },
 });
 
@@ -208,6 +450,7 @@ export const listCards = query({
     filter: v.optional(v.union(cardType, cardStatus, v.literal("all"))),
   },
   handler: async (ctx, args) => {
+    await requireMembership(ctx, args.teamId);
     const cards = await ctx.db
       .query("cards")
       .withIndex("by_team", (q) => q.eq("teamId", args.teamId))
@@ -237,19 +480,10 @@ export const listCards = query({
 export const createCard = mutation({
   args: {
     teamId: v.id("teams"),
-    ...userArgs,
     ...cardInput,
   },
   handler: async (ctx, args) => {
-    const membership = await ctx.db
-      .query("teamMembers")
-      .withIndex("by_team_user", (q) => q.eq("teamId", args.teamId).eq("userId", args.userId))
-      .first();
-
-    if (!membership) {
-      throw new Error("You are not a member of this team.");
-    }
-
+    const { user } = await requireMembership(ctx, args.teamId);
     const now = Date.now();
     const production = productionFields(args);
     return ctx.db.insert("cards", {
@@ -265,8 +499,8 @@ export const createCard = mutation({
       severity: production.severity,
       workaround: production.workaround,
       createdByType: "human",
-      createdById: args.userId,
-      createdByName: args.userName,
+      createdById: user._id,
+      createdByName: user.name,
       createdAt: now,
       updatedAt: now,
     });
@@ -278,16 +512,11 @@ export const updateCardStatus = mutation({
     teamId: v.id("teams"),
     cardId: v.id("cards"),
     status: cardStatus,
-    userId: v.string(),
   },
   handler: async (ctx, args) => {
-    const membership = await ctx.db
-      .query("teamMembers")
-      .withIndex("by_team_user", (q) => q.eq("teamId", args.teamId).eq("userId", args.userId))
-      .first();
+    await requireMembership(ctx, args.teamId);
     const card = await ctx.db.get(args.cardId);
-
-    if (!membership || !card || card.teamId !== args.teamId) {
+    if (!card || card.teamId !== args.teamId) {
       throw new Error("Card not found.");
     }
 
@@ -308,19 +537,15 @@ export const updateProductionCard = mutation({
   args: {
     teamId: v.id("teams"),
     cardId: v.id("cards"),
-    userId: v.string(),
     productionStatus: v.optional(productionStatus),
     severity: v.optional(severity),
     workaround: v.optional(v.string()),
   },
   handler: async (ctx, args) => {
-    const membership = await ctx.db
-      .query("teamMembers")
-      .withIndex("by_team_user", (q) => q.eq("teamId", args.teamId).eq("userId", args.userId))
-      .first();
+    await requireMembership(ctx, args.teamId);
     const card = await ctx.db.get(args.cardId);
 
-    if (!membership || !card || card.teamId !== args.teamId || card.type !== "production") {
+    if (!card || card.teamId !== args.teamId || card.type !== "production") {
       throw new Error("Production card not found.");
     }
 
@@ -351,6 +576,11 @@ export const updateProductionCard = mutation({
 export const listComments = query({
   args: { cardId: v.id("cards") },
   handler: async (ctx, args) => {
+    const card = await ctx.db.get(args.cardId);
+    if (!card) {
+      throw new Error("Card not found.");
+    }
+    await requireMembership(ctx, card.teamId);
     return ctx.db
       .query("comments")
       .withIndex("by_card", (q) => q.eq("cardId", args.cardId))
@@ -362,18 +592,14 @@ export const addComment = mutation({
   args: {
     teamId: v.id("teams"),
     cardId: v.id("cards"),
-    ...userArgs,
     body: v.string(),
   },
   handler: async (ctx, args) => {
-    const membership = await ctx.db
-      .query("teamMembers")
-      .withIndex("by_team_user", (q) => q.eq("teamId", args.teamId).eq("userId", args.userId))
-      .first();
+    const { user } = await requireMembership(ctx, args.teamId);
     const card = await ctx.db.get(args.cardId);
     const body = args.body.trim();
 
-    if (!membership || !card || card.teamId !== args.teamId) {
+    if (!card || card.teamId !== args.teamId) {
       throw new Error("Card not found.");
     }
     if (!body) {
@@ -384,8 +610,8 @@ export const addComment = mutation({
       teamId: args.teamId,
       cardId: args.cardId,
       body,
-      createdById: args.userId,
-      createdByName: args.userName,
+      createdById: user._id,
+      createdByName: user.name,
       createdAt: Date.now(),
     });
   },
@@ -394,16 +620,9 @@ export const addComment = mutation({
 export const listAgentTokens = query({
   args: {
     teamId: v.id("teams"),
-    userId: v.string(),
   },
   handler: async (ctx, args) => {
-    const membership = await ctx.db
-      .query("teamMembers")
-      .withIndex("by_team_user", (q) => q.eq("teamId", args.teamId).eq("userId", args.userId))
-      .first();
-    if (!membership) {
-      throw new Error("You are not a member of this team.");
-    }
+    await requireMembership(ctx, args.teamId, ["owner", "admin"]);
 
     const tokens = await ctx.db
       .query("agentTokens")
@@ -426,20 +645,13 @@ export const listAgentTokens = query({
 export const createAgentToken = mutation({
   args: {
     teamId: v.id("teams"),
-    ...userArgs,
     name: v.string(),
     tokenHash: v.string(),
     tokenPrefix: v.string(),
     scopes: v.array(agentScope),
   },
   handler: async (ctx, args) => {
-    const membership = await ctx.db
-      .query("teamMembers")
-      .withIndex("by_team_user", (q) => q.eq("teamId", args.teamId).eq("userId", args.userId))
-      .first();
-    if (!membership) {
-      throw new Error("You are not a member of this team.");
-    }
+    const { user } = await requireMembership(ctx, args.teamId, ["owner", "admin"]);
 
     const existingHash = await ctx.db
       .query("agentTokens")
@@ -456,7 +668,7 @@ export const createAgentToken = mutation({
       tokenHash: args.tokenHash,
       tokenPrefix: args.tokenPrefix,
       scopes: args.scopes,
-      createdByUserId: args.userId,
+      createdByUserId: user._id,
       createdAt: now,
     });
 
@@ -467,17 +679,13 @@ export const createAgentToken = mutation({
 export const revokeAgentToken = mutation({
   args: {
     teamId: v.id("teams"),
-    userId: v.string(),
     tokenId: v.id("agentTokens"),
   },
   handler: async (ctx, args) => {
-    const membership = await ctx.db
-      .query("teamMembers")
-      .withIndex("by_team_user", (q) => q.eq("teamId", args.teamId).eq("userId", args.userId))
-      .first();
+    await requireMembership(ctx, args.teamId, ["owner", "admin"]);
     const token = await ctx.db.get(args.tokenId);
 
-    if (!membership || !token || token.teamId !== args.teamId) {
+    if (!token || token.teamId !== args.teamId) {
       throw new Error("Agent token not found.");
     }
 
