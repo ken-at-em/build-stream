@@ -1,0 +1,168 @@
+// @vitest-environment jsdom
+
+import { cleanup, render, screen } from "@testing-library/react";
+import { useMutation, useQuery } from "convex/react";
+import type { ReactNode } from "react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { BuildStreamApp } from "@/app/stream-app";
+import { SettingsApp } from "@/app/settings/settings-app";
+import { useBuildStreamWorkspace, type WorkspaceState } from "@/app/workspace-state";
+
+vi.mock("convex/react", () => ({
+  useMutation: vi.fn(),
+  useQuery: vi.fn(),
+}));
+
+vi.mock("next/link", () => ({
+  default: ({
+    children,
+    href,
+  }: {
+    children: ReactNode;
+    href: string;
+  }) => <a href={href}>{children}</a>,
+}));
+
+vi.mock("next-auth/react", () => ({
+  signOut: vi.fn(),
+}));
+
+vi.mock("@/app/workspace-state", () => ({
+  CenteredState: ({ title, body }: { title: string; body: string }) => (
+    <main>
+      <h1>{title}</h1>
+      <p>{body}</p>
+    </main>
+  ),
+  WorkspaceGate: vi.fn(() => null),
+  useBuildStreamWorkspace: vi.fn(),
+}));
+
+const mockedUseBuildStreamWorkspace = vi.mocked(useBuildStreamWorkspace);
+const mockedUseQuery = vi.mocked(useQuery);
+const mockedUseMutation = vi.mocked(useMutation);
+
+const adminWorkspace: WorkspaceState = {
+  session: {
+    user: {
+      id: "test-user-1",
+      githubLogin: "ken-at-em",
+      name: "Test User",
+      email: "test@buildstream.local",
+    },
+    expires: new Date(Date.now() + 60_000).toISOString(),
+  },
+  workspace: {
+    access: "granted",
+    teamId: "teams:test" as never,
+    teamName: "BuildStream Dev",
+    role: "owner",
+    viewer: {
+      userId: "test-user-1",
+      name: "Test User",
+      githubLogin: "ken-at-em",
+      email: "test@buildstream.local",
+    },
+  },
+  workspaceError: null,
+  sessionStatus: "authenticated",
+  convexAuthLoading: false,
+  convexAuthenticated: true,
+  teamId: "teams:test" as never,
+  teamName: "BuildStream Dev",
+  viewer: {
+    userId: "test-user-1",
+    name: "Test User",
+    githubLogin: "ken-at-em",
+    email: "test@buildstream.local",
+  },
+  role: "owner",
+  canManageTeam: true,
+};
+
+describe("admin surfaces", () => {
+  beforeEach(() => {
+    mockedUseMutation.mockReturnValue(vi.fn());
+    mockedUseBuildStreamWorkspace.mockReturnValue(adminWorkspace);
+    mockedUseQuery.mockReset();
+  });
+
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("keeps invite and token management out of the stream sidebar", () => {
+    mockedUseQuery
+      .mockReturnValueOnce([])
+      .mockReturnValueOnce(undefined);
+
+    render(<BuildStreamApp />);
+
+    expect(screen.getByRole("link", { name: /team settings/i }).getAttribute("href")).toBe(
+      "/settings",
+    );
+    expect(screen.queryByText("Agent API")).toBeNull();
+    expect(screen.queryByPlaceholderText("github username")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Create token" })).toBeNull();
+  });
+
+  it("shows team admin controls on the settings page for admins", () => {
+    mockedUseQuery
+      .mockReturnValueOnce({
+        members: [
+          {
+            membershipId: "teamMembers:test",
+            userId: "test-user-1",
+            name: "Test User",
+            githubLogin: "ken-at-em",
+            role: "owner",
+            createdAt: Date.now(),
+          },
+        ],
+        invites: [
+          {
+            inviteId: "teamInvites:test",
+            githubLogin: "future-dev",
+            role: "member",
+            createdAt: Date.now(),
+          },
+        ],
+      })
+      .mockReturnValueOnce([]);
+
+    render(<SettingsApp />);
+
+    expect(screen.getByRole("heading", { name: "Team Settings" })).not.toBeNull();
+    expect(screen.getByText("@ken-at-em")).not.toBeNull();
+    expect(screen.getByText("@future-dev")).not.toBeNull();
+    expect(screen.getByPlaceholderText("github username")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Create token" })).not.toBeNull();
+  });
+
+  it("blocks settings controls for non-admin members", () => {
+    mockedUseBuildStreamWorkspace.mockReturnValue({
+      ...adminWorkspace,
+      role: "member",
+      canManageTeam: false,
+      workspace: {
+        access: "granted",
+        teamId: "teams:test" as never,
+        teamName: "BuildStream Dev",
+        role: "member",
+        viewer: {
+          userId: "test-user-1",
+          name: "Test User",
+          githubLogin: "ken-at-em",
+          email: "test@buildstream.local",
+        },
+      },
+    });
+    mockedUseQuery.mockReturnValue(undefined);
+
+    render(<SettingsApp />);
+
+    expect(screen.getByText("Admin access required")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Create token" })).toBeNull();
+  });
+});

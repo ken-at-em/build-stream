@@ -1,31 +1,29 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import { useConvexAuth, useMutation, useQuery } from "convex/react";
-import { signIn, signOut, useSession } from "next-auth/react";
+import Link from "next/link";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery } from "convex/react";
+import { signOut } from "next-auth/react";
 import {
   AlertTriangle,
-  Bot,
   CheckCircle2,
   CircleHelp,
-  Copy,
   Flame,
   GitBranch,
   LogOut,
   MessageSquare,
   Radio,
   Send,
+  Settings,
   ShipWheel,
   Sparkles,
-  UserPlus,
 } from "lucide-react";
 
 import { api } from "../../convex/_generated/api";
 import type { Id } from "../../convex/_generated/dataModel";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
+import { Card, CardContent } from "@/components/ui/card";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
   Select,
@@ -37,36 +35,12 @@ import {
 import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
+import { useBuildStreamWorkspace, WorkspaceGate } from "./workspace-state";
 
 type CardType = "checkpoint" | "risk" | "question" | "reviewable" | "production" | "shipped";
 type Filter = "all" | CardType | "resolved";
 type ProductionStatus = "investigating" | "mitigating" | "monitoring" | "resolved";
 type Severity = "none" | "sev1" | "sev2" | "sev3";
-type TeamRole = "owner" | "admin" | "member";
-type Workspace =
-  | {
-      access: "granted";
-      teamId: Id<"teams">;
-      teamName: string;
-      role: TeamRole;
-      viewer: {
-        userId: string;
-        name: string;
-        githubLogin: string;
-        email?: string;
-        avatarUrl?: string;
-      };
-    }
-  | {
-      access: "denied";
-      viewer: {
-        userId: string;
-        name: string;
-        githubLogin: string;
-        email?: string;
-        avatarUrl?: string;
-      };
-    };
 
 const cardMeta: Record<
   CardType,
@@ -140,9 +114,7 @@ const severityLabels: Record<Severity, string> = {
 };
 
 export function BuildStreamApp() {
-  const { data: session, status: sessionStatus } = useSession();
-  const { isLoading: convexAuthLoading, isAuthenticated: convexAuthenticated } = useConvexAuth();
-  const [workspace, setWorkspace] = useState<Workspace | null>(null);
+  const workspaceState = useBuildStreamWorkspace();
   const [filter, setFilter] = useState<Filter>("all");
   const [selectedCardId, setSelectedCardId] = useState<Id<"cards"> | null>(null);
   const [summary, setSummary] = useState("");
@@ -151,45 +123,13 @@ export function BuildStreamApp() {
   const [severity, setSeverity] = useState<Severity>("none");
   const [workaround, setWorkaround] = useState("");
   const [comment, setComment] = useState("");
-  const [inviteLogin, setInviteLogin] = useState("");
-  const [inviteRole, setInviteRole] = useState<"member" | "admin">("member");
-  const [agentToken, setAgentToken] = useState<string | null>(null);
-  const [copiedAgentCurl, setCopiedAgentCurl] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const ensureWorkspace = useMutation(api.cards.ensureWorkspace);
   const createCard = useMutation(api.cards.createCard);
   const updateCardStatus = useMutation(api.cards.updateCardStatus);
   const updateProductionCard = useMutation(api.cards.updateProductionCard);
   const addComment = useMutation(api.cards.addComment);
-  const revokeAgentToken = useMutation(api.cards.revokeAgentToken);
-  const createTeamInvite = useMutation(api.cards.createTeamInvite);
-  const revokeTeamInvite = useMutation(api.cards.revokeTeamInvite);
-
-  useEffect(() => {
-    if (sessionStatus !== "authenticated" || !convexAuthenticated) {
-      return;
-    }
-
-    let cancelled = false;
-    ensureWorkspace({})
-      .then((workspace) => {
-        if (cancelled) return;
-        setWorkspace(workspace as Workspace);
-      })
-      .catch((cause) => setError(errorMessage(cause)));
-
-    return () => {
-      cancelled = true;
-    };
-  }, [convexAuthenticated, ensureWorkspace, sessionStatus]);
-
-  const canUseConvex = sessionStatus === "authenticated" && convexAuthenticated;
-  const teamId = canUseConvex && workspace?.access === "granted" ? workspace.teamId : null;
-  const teamName = workspace?.access === "granted" ? workspace.teamName : "BuildStream";
-  const viewer = workspace?.viewer;
-  const role = workspace?.access === "granted" ? workspace.role : null;
-  const canManageTeam = role === "owner" || role === "admin";
+  const { session, teamId, teamName, viewer, role, canManageTeam, workspaceError } = workspaceState;
 
   const cards = useQuery(
     api.cards.listCards,
@@ -201,26 +141,9 @@ export function BuildStreamApp() {
     return cards.find((card) => card._id === selectedCardId) ?? cards[0];
   }, [cards, selectedCardId]);
 
-  const agentCurl = useMemo(() => {
-    if (!agentToken) return "";
-    const origin = typeof window === "undefined" ? "http://localhost:3000" : window.location.origin;
-    return `curl -X POST ${origin}/api/agent/cards \\
-  -H "Authorization: Bearer ${agentToken}" \\
-  -H "Content-Type: application/json" \\
-  -d '{"type":"risk","summary":"Migration touches trigger behavior; need DB review.","agentName":"Codex"}'`;
-  }, [agentToken]);
-
   const comments = useQuery(
     api.cards.listComments,
     selectedCard ? { cardId: selectedCard._id } : "skip",
-  );
-  const agentTokens = useQuery(
-    api.cards.listAgentTokens,
-    teamId && canManageTeam ? { teamId } : "skip",
-  );
-  const teamAdmin = useQuery(
-    api.cards.listTeamAdmin,
-    teamId && canManageTeam ? { teamId } : "skip",
   );
 
   const extractedPrUrl = useMemo(() => extractPrUrl(summary), [summary]);
@@ -331,106 +254,11 @@ export function BuildStreamApp() {
     }
   }
 
-  async function createAgentToken() {
-    if (!teamId) return;
-    setError(null);
-    try {
-      const response = await fetch("/api/agent/tokens", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          teamId,
-          name: "Default agent token",
-        }),
-      });
-      const payload = await response.json();
-      if (!response.ok || typeof payload.token !== "string") {
-        throw new Error(payload.error ?? "Unable to create agent token.");
-      }
-      setAgentToken(payload.token);
-    } catch (cause) {
-      setError(errorMessage(cause));
-    }
-  }
-
-  async function revokeToken(tokenId: Id<"agentTokens">) {
-    if (!teamId) return;
-    setError(null);
-    try {
-      await revokeAgentToken({
-        teamId,
-        tokenId,
-      });
-    } catch (cause) {
-      setError(errorMessage(cause));
-    }
-  }
-
-  async function submitInvite(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!teamId || !inviteLogin.trim()) return;
-    setError(null);
-    try {
-      await createTeamInvite({
-        teamId,
-        githubLogin: inviteLogin,
-        role: inviteRole,
-      });
-      setInviteLogin("");
-      setInviteRole("member");
-    } catch (cause) {
-      setError(errorMessage(cause));
-    }
-  }
-
-  async function revokeInvite(inviteId: Id<"teamInvites">) {
-    if (!teamId) return;
-    setError(null);
-    try {
-      await revokeTeamInvite({ teamId, inviteId });
-    } catch (cause) {
-      setError(errorMessage(cause));
-    }
-  }
-
-  async function copyAgentCurl() {
-    if (!agentCurl) return;
-    setError(null);
-    try {
-      await navigator.clipboard.writeText(agentCurl);
-      setCopiedAgentCurl(true);
-      window.setTimeout(() => setCopiedAgentCurl(false), 1600);
-    } catch {
-      setError("Unable to copy automatically. Select the command text and copy it manually.");
-    }
-  }
-
-  if (sessionStatus === "loading" || convexAuthLoading) {
-    return <CenteredState title="Loading BuildStream" body="Checking your GitHub session..." />;
-  }
-
-  if (sessionStatus === "unauthenticated") {
-    return <SignInScreen />;
-  }
-
-  if (!convexAuthenticated) {
-    return (
-      <CenteredState
-        title="Authentication unavailable"
-        body="BuildStream could not establish a secure app session. Reload or sign in again."
-      />
-    );
-  }
-
-  if (!workspace) {
-    return <CenteredState title="Loading workspace" body="Checking your team access..." />;
-  }
-
-  if (workspace.access === "denied") {
-    return <AccessDeniedScreen viewer={workspace.viewer} />;
-  }
+  const gate = WorkspaceGate({ state: workspaceState });
+  if (gate) return gate;
 
   const viewerInitial = (viewer?.name ?? session?.user?.name ?? "U").charAt(0).toUpperCase();
+  const visibleError = error ?? workspaceError;
 
   return (
     <main className="min-h-screen bg-background text-foreground">
@@ -480,158 +308,12 @@ export function BuildStreamApp() {
           <Separator className="my-6" />
 
           {canManageTeam ? (
-          <Card size="sm">
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2 text-sm">
-                <Bot size={16} />
-                Agent API
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3">
-              <p className="text-xs leading-5 text-muted-foreground">
-                Create a scoped bearer token for local agents. Raw tokens are shown once.
-              </p>
-              <Button type="button" className="w-full" onClick={createAgentToken}>
-                Create token
-              </Button>
-              {agentToken ? (
-                <div className="space-y-2 rounded-lg bg-muted p-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="text-xs font-medium">Agent curl</span>
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="xs"
-                      onClick={copyAgentCurl}
-                    >
-                      <Copy size={12} />
-                      {copiedAgentCurl ? "Copied" : "Copy"}
-                    </Button>
-                  </div>
-                  <pre className="max-h-44 overflow-auto whitespace-pre-wrap break-words font-mono text-[0.68rem] leading-5 text-muted-foreground">
-                    {agentCurl}
-                  </pre>
-                  <p className="text-[0.68rem] leading-4 text-muted-foreground">
-                    Store this token now. It cannot be shown again.
-                  </p>
-                </div>
-              ) : null}
-              {agentTokens?.length ? (
-                <div className="space-y-2 border-t pt-3">
-                  <p className="text-xs font-medium">Tokens</p>
-                  {agentTokens.map((token) => (
-                    <div
-                      key={token.tokenId}
-                      className="space-y-2 rounded-lg border bg-background p-2"
-                    >
-                      <div className="flex items-start justify-between gap-2">
-                        <div className="min-w-0">
-                          <p className="truncate text-xs font-medium">{token.name}</p>
-                          <p className="text-[0.68rem] text-muted-foreground">
-                            {token.tokenPrefix}
-                            {token.revokedAt ? " · revoked" : token.lastUsedAt ? " · used" : " · unused"}
-                          </p>
-                        </div>
-                        {!token.revokedAt ? (
-                          <Button
-                            type="button"
-                            variant="outline"
-                            size="xs"
-                            onClick={() => revokeToken(token.tokenId)}
-                          >
-                            Revoke
-                          </Button>
-                        ) : null}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              ) : null}
-            </CardContent>
-          </Card>
-          ) : null}
-
-          {canManageTeam ? (
-            <Card size="sm" className="mt-4">
-              <CardHeader>
-                <CardTitle className="flex items-center gap-2 text-sm">
-                  <UserPlus size={16} />
-                  Team
-                </CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3">
-                <form onSubmit={submitInvite} className="space-y-2">
-                  <Input
-                    value={inviteLogin}
-                    onChange={(event) => setInviteLogin(event.target.value)}
-                    placeholder="github username"
-                  />
-                  <div className="grid grid-cols-[1fr_auto] gap-2">
-                    <Select
-                      value={inviteRole}
-                      onValueChange={(value) => setInviteRole(value as "member" | "admin")}
-                    >
-                      <SelectTrigger>
-                        <SelectValue />
-                      </SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="member">Member</SelectItem>
-                        <SelectItem value="admin">Admin</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <Button disabled={!inviteLogin.trim()}>Invite</Button>
-                  </div>
-                </form>
-                {teamAdmin ? (
-                  <div className="space-y-3 border-t pt-3">
-                    <div>
-                      <p className="text-xs font-medium">Members</p>
-                      <div className="mt-2 space-y-1">
-                        {teamAdmin.members.map((member) => (
-                          <div
-                            key={member.membershipId}
-                            className="flex items-center justify-between gap-2 text-xs"
-                          >
-                            <span className="truncate">
-                              {member.githubLogin ? `@${member.githubLogin}` : member.name}
-                            </span>
-                            <Badge variant="secondary">{member.role}</Badge>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                    <div>
-                      <p className="text-xs font-medium">Invites</p>
-                      <div className="mt-2 space-y-1">
-                        {teamAdmin.invites.filter((invite) => !invite.acceptedAt && !invite.revokedAt)
-                          .length ? (
-                          teamAdmin.invites
-                            .filter((invite) => !invite.acceptedAt && !invite.revokedAt)
-                            .map((invite) => (
-                              <div
-                                key={invite.inviteId}
-                                className="flex items-center justify-between gap-2 text-xs"
-                              >
-                                <span className="truncate">@{invite.githubLogin}</span>
-                                <Button
-                                  type="button"
-                                  variant="ghost"
-                                  size="xs"
-                                  onClick={() => revokeInvite(invite.inviteId)}
-                                >
-                                  Revoke
-                                </Button>
-                              </div>
-                            ))
-                        ) : (
-                          <p className="text-xs text-muted-foreground">No pending invites.</p>
-                        )}
-                      </div>
-                    </div>
-                  </div>
-                ) : null}
-              </CardContent>
-            </Card>
+            <Button asChild variant="ghost" className="w-full justify-start">
+              <Link href="/settings">
+                <Settings size={16} />
+                Team Settings
+              </Link>
+            </Button>
           ) : null}
         </aside>
 
@@ -740,9 +422,9 @@ export function BuildStreamApp() {
               </CardContent>
             </Card>
 
-            {error ? (
+            {visibleError ? (
               <div className="mt-4 rounded-lg border border-destructive/25 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                {error}
+                {visibleError}
               </div>
             ) : null}
 
@@ -900,65 +582,6 @@ export function BuildStreamApp() {
           )}
         </aside>
       </div>
-    </main>
-  );
-}
-
-function SignInScreen() {
-  return (
-    <main className="flex min-h-screen items-center justify-center bg-background px-6 text-foreground">
-      <Card className="w-full max-w-sm">
-        <CardContent className="space-y-4 text-center">
-          <div className="mx-auto flex size-10 items-center justify-center rounded-lg bg-primary text-primary-foreground">
-            <GitBranch size={19} />
-          </div>
-          <div>
-            <h1 className="text-xl font-semibold">BuildStream</h1>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Sign in with GitHub to enter your team stream.
-            </p>
-          </div>
-          <Button type="button" className="w-full" onClick={() => signIn("github")}>
-            Sign in with GitHub
-          </Button>
-        </CardContent>
-      </Card>
-    </main>
-  );
-}
-
-function AccessDeniedScreen({ viewer }: { viewer: Workspace["viewer"] }) {
-  return (
-    <main className="flex min-h-screen items-center justify-center bg-background px-6 text-foreground">
-      <Card className="w-full max-w-sm">
-        <CardContent className="space-y-4 text-center">
-          <Badge variant="secondary" className="mx-auto">
-            @{viewer.githubLogin}
-          </Badge>
-          <div>
-            <h1 className="text-xl font-semibold">Invite required</h1>
-            <p className="mt-2 text-sm text-muted-foreground">
-              Ask a BuildStream owner or admin to invite your GitHub username.
-            </p>
-          </div>
-          <Button type="button" variant="outline" className="w-full" onClick={() => signOut()}>
-            Sign out
-          </Button>
-        </CardContent>
-      </Card>
-    </main>
-  );
-}
-
-function CenteredState({ title, body }: { title: string; body: string }) {
-  return (
-    <main className="flex min-h-screen items-center justify-center bg-background px-6 text-foreground">
-      <Card className="w-full max-w-sm">
-        <CardContent>
-          <h1 className="text-lg font-semibold">{title}</h1>
-          <p className="mt-2 text-sm text-muted-foreground">{body}</p>
-        </CardContent>
-      </Card>
     </main>
   );
 }
