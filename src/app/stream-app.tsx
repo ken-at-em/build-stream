@@ -1,20 +1,16 @@
 "use client";
 
-import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { useMemo, useState } from "react";
 import { useMutation, useQuery } from "convex/react";
-import { signOut } from "next-auth/react";
 import {
   AlertTriangle,
   CheckCircle2,
   CircleHelp,
   Flame,
-  GitBranch,
-  LogOut,
   MessageSquare,
   Radio,
   Send,
-  Settings,
   ShipWheel,
   Sparkles,
 } from "lucide-react";
@@ -32,10 +28,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
-import { Separator } from "@/components/ui/separator";
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "@/lib/utils";
-import { useBuildStreamWorkspace, WorkspaceGate } from "./workspace-state";
+import { useAppWorkspace } from "./app-shell";
 
 type CardType = "checkpoint" | "risk" | "question" | "reviewable" | "production" | "shipped";
 type Filter = "all" | CardType | "resolved";
@@ -114,8 +109,9 @@ const severityLabels: Record<Severity, string> = {
 };
 
 export function BuildStreamApp() {
-  const workspaceState = useBuildStreamWorkspace();
-  const [filter, setFilter] = useState<Filter>("all");
+  const workspaceState = useAppWorkspace();
+  const searchParams = useSearchParams();
+  const filter = normalizeFilter(searchParams.get("filter"));
   const [selectedCardId, setSelectedCardId] = useState<Id<"cards"> | null>(null);
   const [summary, setSummary] = useState("");
   const [type, setType] = useState<CardType>("risk");
@@ -129,7 +125,7 @@ export function BuildStreamApp() {
   const updateCardStatus = useMutation(api.cards.updateCardStatus);
   const updateProductionCard = useMutation(api.cards.updateProductionCard);
   const addComment = useMutation(api.cards.addComment);
-  const { session, teamId, teamName, viewer, role, canManageTeam, workspaceError } = workspaceState;
+  const { session, teamId, viewer, workspaceError } = workspaceState;
 
   const cards = useQuery(
     api.cards.listCards,
@@ -197,7 +193,6 @@ export function BuildStreamApp() {
       setSeverity("none");
       setWorkaround("");
       setSelectedCardId(cardId);
-      setFilter("all");
     } catch (cause) {
       setError(errorMessage(cause));
     }
@@ -254,77 +249,11 @@ export function BuildStreamApp() {
     }
   }
 
-  const gate = WorkspaceGate({ state: workspaceState });
-  if (gate) return gate;
-
   const viewerInitial = (viewer?.name ?? session?.user?.name ?? "U").charAt(0).toUpperCase();
   const visibleError = error ?? workspaceError;
 
   return (
-    <main className="min-h-screen bg-background text-foreground">
-      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[240px_minmax(0,1fr)_360px]">
-        <aside className="border-b bg-sidebar px-5 py-5 text-sidebar-foreground lg:border-b-0 lg:border-r">
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-center gap-2">
-              <div className="flex size-9 items-center justify-center rounded-lg bg-sidebar-primary text-sidebar-primary-foreground">
-                <GitBranch size={18} />
-              </div>
-              <div>
-                <h1 className="text-lg font-semibold">BuildStream</h1>
-                <p className="text-xs text-muted-foreground">{teamName}</p>
-              </div>
-            </div>
-            <Button type="button" variant="ghost" size="icon" onClick={() => signOut()}>
-              <LogOut size={15} />
-            </Button>
-          </div>
-
-          <div className="mt-5 flex items-center gap-3 rounded-lg border bg-background p-2">
-            <div className="flex size-8 shrink-0 items-center justify-center rounded-full bg-primary text-sm font-semibold text-primary-foreground">
-              {viewerInitial}
-            </div>
-            <div className="min-w-0">
-              <p className="truncate text-sm font-medium">{viewer?.name}</p>
-              <p className="truncate text-xs text-muted-foreground">
-                @{viewer?.githubLogin} · {role}
-              </p>
-            </div>
-          </div>
-
-          <nav className="mt-8 space-y-1">
-            {filters.map((item) => (
-              <Button
-                key={item.value}
-                type="button"
-                variant={filter === item.value ? "secondary" : "ghost"}
-                className="w-full justify-start"
-                onClick={() => setFilter(item.value)}
-              >
-                {item.label}
-              </Button>
-            ))}
-          </nav>
-
-          <Separator className="my-6" />
-
-          <div className="space-y-1">
-            <Button asChild variant="ghost" className="w-full justify-start">
-              <Link href="/settings">
-                <Settings size={16} />
-                My Settings
-              </Link>
-            </Button>
-            {canManageTeam ? (
-              <Button asChild variant="ghost" className="w-full justify-start">
-                <Link href="/settings/team">
-                  <Settings size={16} />
-                  Team Settings
-                </Link>
-              </Button>
-            ) : null}
-          </div>
-        </aside>
-
+      <div className="grid min-h-screen grid-cols-1 lg:grid-cols-[minmax(0,1fr)_360px]">
         <section className="min-w-0 border-b px-4 py-5 lg:border-b-0 lg:border-r lg:px-6">
           <div className="mx-auto w-full max-w-2xl">
             <Card className="overflow-visible">
@@ -590,7 +519,6 @@ export function BuildStreamApp() {
           )}
         </aside>
       </div>
-    </main>
   );
 }
 
@@ -790,6 +718,10 @@ function extractPrUrl(text: string) {
   );
 
   return prUrl?.replace(/[.,;:!?]+$/, "");
+}
+
+function normalizeFilter(value: string | null): Filter {
+  return filters.some((item) => item.value === value) ? (value as Filter) : "all";
 }
 
 function errorMessage(error: unknown) {

@@ -2,45 +2,28 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { useMutation, useQuery } from "convex/react";
-import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { BuildStreamApp } from "@/app/stream-app";
 import { MySettingsApp } from "@/app/settings/my-settings-app";
 import { TeamSettingsApp } from "@/app/settings/team/team-settings-app";
-import { useBuildStreamWorkspace, type WorkspaceState } from "@/app/workspace-state";
+import { useAppWorkspace } from "@/app/app-shell";
+import type { WorkspaceState } from "@/app/workspace-state";
 
 vi.mock("convex/react", () => ({
   useMutation: vi.fn(),
   useQuery: vi.fn(),
 }));
 
-vi.mock("next/link", () => ({
-  default: ({
-    children,
-    href,
-  }: {
-    children: ReactNode;
-    href: string;
-  }) => <a href={href}>{children}</a>,
+vi.mock("next/navigation", () => ({
+  useSearchParams: vi.fn(() => new URLSearchParams()),
 }));
 
-vi.mock("next-auth/react", () => ({
-  signOut: vi.fn(),
+vi.mock("@/app/app-shell", () => ({
+  useAppWorkspace: vi.fn(),
 }));
 
-vi.mock("@/app/workspace-state", () => ({
-  CenteredState: ({ title, body }: { title: string; body: string }) => (
-    <main>
-      <h1>{title}</h1>
-      <p>{body}</p>
-    </main>
-  ),
-  WorkspaceGate: vi.fn(() => null),
-  useBuildStreamWorkspace: vi.fn(),
-}));
-
-const mockedUseBuildStreamWorkspace = vi.mocked(useBuildStreamWorkspace);
+const mockedUseAppWorkspace = vi.mocked(useAppWorkspace);
 const mockedUseQuery = vi.mocked(useQuery);
 const mockedUseMutation = vi.mocked(useMutation);
 
@@ -85,7 +68,7 @@ const adminWorkspace: WorkspaceState = {
 describe("admin surfaces", () => {
   beforeEach(() => {
     mockedUseMutation.mockReturnValue(vi.fn());
-    mockedUseBuildStreamWorkspace.mockReturnValue(adminWorkspace);
+    mockedUseAppWorkspace.mockReturnValue(adminWorkspace);
     mockedUseQuery.mockReset();
   });
 
@@ -93,26 +76,20 @@ describe("admin surfaces", () => {
     cleanup();
   });
 
-  it("keeps invite and token management out of the stream sidebar", () => {
+  it("keeps invite and token management out of the stream", () => {
     mockedUseQuery
       .mockReturnValueOnce([])
       .mockReturnValueOnce(undefined);
 
     render(<BuildStreamApp />);
 
-    expect(screen.getByRole("link", { name: /my settings/i }).getAttribute("href")).toBe(
-      "/settings",
-    );
-    expect(screen.getByRole("link", { name: /team settings/i }).getAttribute("href")).toBe(
-      "/settings/team",
-    );
     expect(screen.queryByText("Agent API")).toBeNull();
     expect(screen.queryByPlaceholderText("github username")).toBeNull();
     expect(screen.queryByRole("button", { name: "Create token" })).toBeNull();
   });
 
   it("shows personal agent tokens on My Settings for any member", () => {
-    mockedUseBuildStreamWorkspace.mockReturnValue({
+    mockedUseAppWorkspace.mockReturnValue({
       ...adminWorkspace,
       role: "member",
       canManageTeam: false,
@@ -136,7 +113,6 @@ describe("admin surfaces", () => {
     expect(screen.getByRole("heading", { name: "My Settings" })).not.toBeNull();
     expect(screen.getByText("My Agent Tokens")).not.toBeNull();
     expect(screen.getByRole("button", { name: "Create token" })).not.toBeNull();
-    expect(screen.queryByRole("link", { name: /team settings/i })).toBeNull();
   });
 
   it("shows team admin controls on the team settings page for admins", () => {
@@ -174,7 +150,7 @@ describe("admin surfaces", () => {
   });
 
   it("blocks team settings controls for non-admin members", () => {
-    mockedUseBuildStreamWorkspace.mockReturnValue({
+    mockedUseAppWorkspace.mockReturnValue({
       ...adminWorkspace,
       role: "member",
       canManageTeam: false,
