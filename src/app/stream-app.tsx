@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useState } from "react";
-import { useMutation, useQuery } from "convex/react";
+import { useConvexAuth, useMutation, useQuery } from "convex/react";
 import { signIn, signOut, useSession } from "next-auth/react";
 import {
   AlertTriangle,
@@ -141,6 +141,7 @@ const severityLabels: Record<Severity, string> = {
 
 export function BuildStreamApp() {
   const { data: session, status: sessionStatus } = useSession();
+  const { isLoading: convexAuthLoading, isAuthenticated: convexAuthenticated } = useConvexAuth();
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [filter, setFilter] = useState<Filter>("all");
   const [selectedCardId, setSelectedCardId] = useState<Id<"cards"> | null>(null);
@@ -166,7 +167,7 @@ export function BuildStreamApp() {
   const revokeTeamInvite = useMutation(api.cards.revokeTeamInvite);
 
   useEffect(() => {
-    if (sessionStatus !== "authenticated") {
+    if (sessionStatus !== "authenticated" || !convexAuthenticated) {
       return;
     }
 
@@ -181,9 +182,10 @@ export function BuildStreamApp() {
     return () => {
       cancelled = true;
     };
-  }, [ensureWorkspace, sessionStatus]);
+  }, [convexAuthenticated, ensureWorkspace, sessionStatus]);
 
-  const teamId = workspace?.access === "granted" ? workspace.teamId : null;
+  const canUseConvex = sessionStatus === "authenticated" && convexAuthenticated;
+  const teamId = canUseConvex && workspace?.access === "granted" ? workspace.teamId : null;
   const teamName = workspace?.access === "granted" ? workspace.teamName : "BuildStream";
   const viewer = workspace?.viewer;
   const role = workspace?.access === "granted" ? workspace.role : null;
@@ -403,12 +405,21 @@ export function BuildStreamApp() {
     }
   }
 
-  if (sessionStatus === "loading") {
+  if (sessionStatus === "loading" || convexAuthLoading) {
     return <CenteredState title="Loading BuildStream" body="Checking your GitHub session..." />;
   }
 
   if (sessionStatus === "unauthenticated") {
     return <SignInScreen />;
+  }
+
+  if (!convexAuthenticated) {
+    return (
+      <CenteredState
+        title="Authentication unavailable"
+        body="BuildStream could not establish a secure app session. Reload or sign in again."
+      />
+    );
   }
 
   if (!workspace) {
